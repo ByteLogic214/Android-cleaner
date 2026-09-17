@@ -1,5 +1,6 @@
 package com.turboclean
 
+import android.app.Activity
 import android.app.Application
 import android.content.Context
 import android.content.Intent
@@ -21,13 +22,14 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AutoDelete
@@ -42,7 +44,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -55,6 +56,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -65,188 +67,489 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.net.InetSocketAddress
 
-private val Background = Color(0xFF070B14)
-private val Surface = Color(0xFF111827)
-private val SurfaceAlt = Color(0xFF172033)
-private val Blue = Color(0xFF168BFF)
-private val Green = Color(0xFF58FF9A)
-private val Primary = Color(0xFFF4F8FF)
-private val Secondary = Color(0xFF9AA9C2)
+private val TurboBackground = Color(0xFF070B14)
+private val TurboSurface = Color(0xFF111827)
+private val TurboSurfaceAlt = Color(0xFF172033)
+private val ElectricBlue = Color(0xFF168BFF)
+private val NeonGreen = Color(0xFF58FF9A)
+private val TextPrimary = Color(0xFFF4F8FF)
+private val TextSecondary = Color(0xFF9AA9C2)
 
 class MainActivity : ComponentActivity() {
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val model = ViewModelProvider(this)[TurboCleanViewModel::class.java]
+
+        val viewModel = ViewModelProvider(this)[TurboCleanViewModel::class.java]
+
         setContent {
             MaterialTheme {
-                val state by model.state.collectAsState()
+                val state by viewModel.uiState.collectAsStateWithLifecycle()
+
                 TurboCleanScreen(
                     state = state,
-                    onScan = model::scanGarbage,
-                    onDelete = model::deleteSelected,
-                    onNetwork = model::diagnoseNetwork,
-                    onStoragePermission = ::openAllFilesSettings,
-                    onUsagePermission = ::openUsageSettings,
-                    onStorageGuide = ::openStorageSettings
+                    onClean = viewModel::scanGarbage,
+                    onNetwork = viewModel::diagnoseNetwork,
+                    onPermissions = ::openStorageAccessSettings
                 )
             }
         }
     }
 
-    private fun openAllFilesSettings() {
+    override fun onResume() {
+        super.onResume()
+        val viewModel = ViewModelProvider(this)[TurboCleanViewModel::class.java]
+        viewModel.refreshPermissionStatus()
+    }
+
+    private fun openStorageAccessSettings() {
         val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName"))
-        } else Intent(Settings.ACTION_INTERNAL_STORAGE_SETTINGS)
+            Intent(
+                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                Uri.parse("package:$packageName")
+            )
+        } else {
+            Intent(Settings.ACTION_INTERNAL_STORAGE_SETTINGS)
+        }
+
         startActivity(intent)
     }
-    private fun openUsageSettings() = startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
-    private fun openStorageSettings() = startActivity(Intent(Settings.ACTION_INTERNAL_STORAGE_SETTINGS))
 }
 
-data class GarbageItem(val name: String, val path: String, val bytes: Long, val category: String)
-data class TurboState(
-    val performance: Int = 82,
-    val garbage: String = "Toca para analizar",
-    val network: String = "Sin diagnóstico",
-    val scanning: Boolean = false,
-    val items: List<GarbageItem> = emptyList()
+data class GarbageItem(
+    val name: String,
+    val path: String,
+    val sizeBytes: Long,
+    val category: String
 )
 
-class TurboCleanViewModel(app: Application) : AndroidViewModel(app) {
-    private val context = app.applicationContext
-    private val _state = MutableStateFlow(TurboState())
-    val state: StateFlow<TurboState> = _state.asStateFlow()
+data class TurboCleanUiState(
+    val performance: Int = 82,
+    val garbageText: String = "Toca para analizar",
+    val networkText: String = "Sin diagnóstico",
+    val permissionText: String = "Configurar accesos",
+    val isScanning: Boolean = false,
+    val garbageItems: List<GarbageItem> = emptyList()
+)
 
-    fun scanGarbage() = viewModelScope.launch {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
-            _state.value = _state.value.copy(garbage = "Concede acceso a archivos para analizar")
-            return@launch
+class TurboCleanViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val context = application.applicationContext
+
+    private val _uiState = MutableStateFlow(TurboCleanUiState())
+    val uiState: StateFlow<TurboCleanUiState> = _uiState.asStateFlow()
+
+    init {
+        refreshPermissionStatus()
+    }
+
+    fun refreshPermissionStatus() {
+        val storageGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.R ||
+            Environment.isExternalStorageManager()
+
+        _uiState.value = _uiState.value.copy(
+            permissionText = if (storageGranted) {
+                "Acceso a archivos activo"
+            } else {
+                "Autoriza acceso a archivos"
+            }
+        )
+    }
+
+    fun scanGarbage() {
+        viewModelScope.launch {
+            val needsAllFilesAccess = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+
+            if (needsAllFilesAccess && !Environment.isExternalStorageManager()) {
+                _uiState.value = _uiState.value.copy(
+                    garbageText = "Autoriza acceso a archivos primero"
+                )
+                return@launch
+            }
+
+            _uiState.value = _uiState.value.copy(
+                isScanning = true,
+                garbageText = "Analizando almacenamiento…"
+            )
+
+            val result = StorageCleaner.scanGarbage()
+
+            _uiState.value = _uiState.value.copy(
+                isScanning = false,
+                garbageItems = result,
+                garbageText = when {
+                    result.isEmpty() -> "No se detectó basura segura"
+                    else -> "${result.size} elementos detectados"
+                }
+            )
         }
-        _state.value = _state.value.copy(scanning = true, garbage = "Analizando archivos permitidos…")
-        val found = StorageCleaner.scan()
-        _state.value = _state.value.copy(scanning = false, items = found,
-            garbage = if (found.isEmpty()) "No se detectó basura segura" else "${found.size} elementos para revisar")
     }
 
-    fun deleteSelected() = viewModelScope.launch {
-        val deleted = StorageCleaner.delete(_state.value.items)
-        _state.value = _state.value.copy(items = emptyList(), garbage = "${deleted.size} elementos eliminados")
-    }
+    fun diagnoseNetwork() {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                networkText = "Midiendo latencia…"
+            )
 
-    fun diagnoseNetwork() = viewModelScope.launch {
-        _state.value = _state.value.copy(network = "Midiendo latencia…")
-        val result = NetworkDiagnostics.run(context)
-        _state.value = _state.value.copy(network = result.message, performance = result.performance)
+            val result = NetworkDiagnostics.diagnose(context)
+
+            _uiState.value = _uiState.value.copy(
+                networkText = result.recommendation,
+                performance = result.performance
+            )
+        }
     }
 }
 
-/** Only scans shared locations where the user has granted access. */
 object StorageCleaner {
-    suspend fun scan(): List<GarbageItem> = withContext(Dispatchers.IO) {
+
+    suspend fun scanGarbage(): List<GarbageItem> = withContext(Dispatchers.IO) {
         val roots = listOf(
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
             Environment.getExternalStorageDirectory()
-        ).filter { it.exists() && it.canRead() }.distinctBy { it.canonicalPath }
-        val blocked = listOf("/Android/data", "/Android/obb")
-        val found = mutableListOf<GarbageItem>()
-        roots.forEach { root -> runCatching {
-            root.walkTopDown().maxDepth(7).onEnter { dir -> blocked.none { dir.path.contains(it) } }.forEach { file ->
-                when {
-                    file.isFile && file.extension.lowercase() in setOf("tmp", "log") ->
-                        found += GarbageItem(file.name, file.path, file.length(), "Archivo temporal")
-                    file.isDirectory && file.listFiles()?.isEmpty() == true ->
-                        found += GarbageItem(file.name.ifBlank { "Carpeta vacía" }, file.path, 0, "Carpeta vacía")
-                }
-            }
-        } }
-        found.distinctBy { it.path }.sortedByDescending { it.bytes }
-    }
-    suspend fun delete(items: List<GarbageItem>): List<GarbageItem> = withContext(Dispatchers.IO) {
-        items.filter { File(it.path).let { file -> file.exists() && file.delete() } }
-    }
-}
+        )
+            .filter { it.exists() && it.canRead() }
+            .distinctBy { it.absolutePath }
 
-private data class NetworkResult(val message: String, val performance: Int)
-private object NetworkDiagnostics {
-    suspend fun run(context: Context): NetworkResult = withContext(Dispatchers.IO) {
-        val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val network = manager.activeNetwork ?: return@withContext NetworkResult("Sin conexión. Revisa Wi‑Fi o datos móviles.", 35)
-        val caps = manager.getNetworkCapabilities(network) ?: return@withContext NetworkResult("Red no disponible.", 35)
-        if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED))
-            return@withContext NetworkResult("La red no tiene Internet validado.", 45)
-        val start = System.nanoTime()
-        val latency = runCatching {
-            network.socketFactory.createSocket().use { it.connect(InetSocketAddress("1.1.1.1", 443), 3000) }
-            (System.nanoTime() - start) / 1_000_000
-        }.getOrNull()
-        when {
-            latency == null -> NetworkResult("No se pudo medir; prueba otra red o DNS.", 55)
-            latency < 70 -> NetworkResult("Red estable: ${latency} ms. Buena para juegos.", 92)
-            latency < 150 -> NetworkResult("${latency} ms: usa Wi‑Fi 5 GHz si está disponible.", 75)
-            else -> NetworkResult("${latency} ms: acércate al router y limita datos en segundo plano.", 58)
-        }
-    }
-}
+        val ignoredPaths = listOf(
+            "/Android/data",
+            "/Android/obb",
+            "/Android/media"
+        )
 
-private data class CardInfo(val title: String, val subtitle: String, val value: String, val icon: ImageVector, val accent: Color, val action: () -> Unit)
+        val results = mutableListOf<GarbageItem>()
 
-@Composable private fun TurboCleanScreen(state: TurboState, onScan: () -> Unit, onDelete: () -> Unit, onNetwork: () -> Unit, onStoragePermission: () -> Unit, onUsagePermission: () -> Unit, onStorageGuide: () -> Unit) {
-    val cards = listOf(
-        CardInfo("Limpiador de Basura", "Archivos temporales y carpetas vacías", state.garbage, Icons.Rounded.AutoDelete, Green, onScan),
-        CardInfo("Liberador de RAM", "Android administra la memoria", "Revisa el uso de apps", Icons.Rounded.Memory, Blue, onUsagePermission),
-        CardInfo("Optimizar Red", "Latencia y conexión", state.network, Icons.Rounded.NetworkCheck, Green, onNetwork),
-        CardInfo("Gestión de Permisos", "Archivos y estadísticas de uso", "Configurar accesos", Icons.Rounded.Security, Blue, onStoragePermission)
-    )
-    Surface(modifier = Modifier.fillMaxSize(), color = Background) {
-        Column(modifier = Modifier.padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("TurboClean", color = Primary, fontSize = 30.sp, fontWeight = FontWeight.Bold)
-            Text("Optimización segura del dispositivo", color = Secondary, modifier = Modifier.padding(top = 4.dp))
-            PerformanceIndicator(state.performance, state.scanning, onScan, Modifier.padding(vertical = 22.dp))
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                items(cards) { OptimizationCard(it) }
-                if (state.items.isNotEmpty()) item {
-                    Card(colors = CardDefaults.cardColors(containerColor = Surface), shape = RoundedCornerShape(20.dp)) {
-                        Column(Modifier.padding(16.dp)) {
-                            Text("Resultados: revisa antes de borrar", color = Primary, fontWeight = FontWeight.Bold)
-                            state.items.take(12).forEach { Text("• ${it.category}: ${it.name}", color = Secondary, fontSize = 12.sp, modifier = Modifier.padding(top = 5.dp)) }
-                            Text("Eliminar elementos mostrados", color = Green, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 14.dp).clickable(onClick = onDelete))
+        roots.forEach { root ->
+            runCatching {
+                root.walkTopDown()
+                    .onEnter { folder ->
+                        ignoredPaths.none { ignoredPath ->
+                            folder.absolutePath.contains(ignoredPath)
                         }
                     }
+                    .maxDepth(8)
+                    .forEach { file ->
+                        when {
+                            file.isFile &&
+                                file.extension.lowercase() in setOf("tmp", "log") -> {
+                                results += GarbageItem(
+                                    name = file.name,
+                                    path = file.absolutePath,
+                                    sizeBytes = file.length(),
+                                    category = "Archivo temporal"
+                                )
+                            }
+
+                            file.isDirectory &&
+                                file.listFiles()?.isEmpty() == true -> {
+                                results += GarbageItem(
+                                    name = file.name.ifBlank { "Carpeta vacía" },
+                                    path = file.absolutePath,
+                                    sizeBytes = 0L,
+                                    category = "Carpeta vacía"
+                                )
+                            }
+                        }
+                    }
+            }
+        }
+
+        results
+            .distinctBy { it.path }
+            .sortedByDescending { it.sizeBytes }
+    }
+
+    suspend fun deleteSelected(items: List<GarbageItem>): List<GarbageItem> =
+        withContext(Dispatchers.IO) {
+            items.filter { item ->
+                val file = File(item.path)
+                file.exists() && file.delete()
+            }
+        }
+}
+
+data class NetworkDiagnostic(
+    val latencyMs: Long?,
+    val recommendation: String,
+    val performance: Int
+)
+
+object NetworkDiagnostics {
+
+    suspend fun diagnose(context: Context): NetworkDiagnostic =
+        withContext(Dispatchers.IO) {
+            val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+                as ConnectivityManager
+
+            val network = manager.activeNetwork
+                ?: return@withContext NetworkDiagnostic(
+                    latencyMs = null,
+                    recommendation = "Sin conexión. Revisa Wi‑Fi o datos móviles.",
+                    performance = 35
+                )
+
+            val capabilities = manager.getNetworkCapabilities(network)
+                ?: return@withContext NetworkDiagnostic(
+                    latencyMs = null,
+                    recommendation = "Conexión no disponible.",
+                    performance = 35
+                )
+
+            if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                return@withContext NetworkDiagnostic(
+                    latencyMs = null,
+                    recommendation = "La red no tiene acceso validado a Internet.",
+                    performance = 45
+                )
+            }
+
+            val startTime = System.nanoTime()
+
+            val latency = runCatching {
+                network.socketFactory.createSocket().use { socket ->
+                    socket.connect(InetSocketAddress("1.1.1.1", 443), 3_000)
                 }
-                item { Text("Abrir almacenamiento del sistema", color = Blue, modifier = Modifier.padding(4.dp).clickable(onClick = onStorageGuide)) }
+
+                (System.nanoTime() - startTime) / 1_000_000
+            }.getOrNull()
+
+            when {
+                latency == null -> NetworkDiagnostic(
+                    latencyMs = null,
+                    recommendation = "No se pudo medir. Prueba otra red o revisa DNS.",
+                    performance = 55
+                )
+
+                latency < 70 -> NetworkDiagnostic(
+                    latencyMs = latency,
+                    recommendation = "Red estable: $latency ms. Ideal para juegos.",
+                    performance = 92
+                )
+
+                latency < 150 -> NetworkDiagnostic(
+                    latencyMs = latency,
+                    recommendation = "Latencia media: $latency ms. Usa Wi‑Fi de 5 GHz si está disponible.",
+                    performance = 75
+                )
+
+                else -> NetworkDiagnostic(
+                    latencyMs = latency,
+                    recommendation = "Latencia alta: $latency ms. Acércate al router o limita datos en segundo plano.",
+                    performance = 58
+                )
+            }
+        }
+}
+
+data class OptimizationCardModel(
+    val title: String,
+    val subtitle: String,
+    val value: String,
+    val accent: Color,
+    val icon: ImageVector,
+    val onClick: () -> Unit
+)
+
+@Composable
+fun TurboCleanScreen(
+    state: TurboCleanUiState,
+    onClean: () -> Unit,
+    onNetwork: () -> Unit,
+    onPermissions: () -> Unit
+) {
+    val cards = listOf(
+        OptimizationCardModel(
+            title = "Limpiador de Basura",
+            subtitle = "Archivos .tmp y carpetas vacías",
+            value = state.garbageText,
+            accent = NeonGreen,
+            icon = Icons.Rounded.AutoDelete,
+            onClick = onClean
+        ),
+        OptimizationCardModel(
+            title = "Liberador de RAM",
+            subtitle = "Android administra la memoria",
+            value = "Consulta procesos y uso",
+            accent = ElectricBlue,
+            icon = Icons.Rounded.Memory,
+            onClick = {}
+        ),
+        OptimizationCardModel(
+            title = "Optimizar Red",
+            subtitle = "Latencia y calidad de conexión",
+            value = state.networkText,
+            accent = NeonGreen,
+            icon = Icons.Rounded.NetworkCheck,
+            onClick = onNetwork
+        ),
+        OptimizationCardModel(
+            title = "Gestión de Permisos",
+            subtitle = "Acceso a archivos y uso de apps",
+            value = state.permissionText,
+            accent = ElectricBlue,
+            icon = Icons.Rounded.Security,
+            onClick = onPermissions
+        )
+    )
+
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = TurboBackground
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 20.dp, vertical = 28.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = "TurboClean",
+                color = TextPrimary,
+                fontSize = 30.sp,
+                fontWeight = FontWeight.Bold
+            )
+
+            Text(
+                text = "Optimización segura del dispositivo",
+                color = TextSecondary,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+
+            PerformanceIndicator(
+                performance = state.performance,
+                isScanning = state.isScanning,
+                onClick = onClean,
+                modifier = Modifier.padding(vertical = 30.dp)
+            )
+
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(2),
+                contentPadding = PaddingValues(bottom = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                items(cards, key = { it.title }) { card ->
+                    OptimizationCard(card)
+                }
             }
         }
     }
 }
 
-@Composable private fun PerformanceIndicator(performance: Int, scanning: Boolean, action: () -> Unit, modifier: Modifier = Modifier) {
-    val transition = rememberInfiniteTransition(label = "pulse")
-    val scale by transition.animateFloat(1f, 1.035f, infiniteRepeatable(tween(1000), RepeatMode.Reverse), label = "scale")
-    Card(modifier = modifier.size(210.dp).scale(scale).clickable(onClick = action), shape = RoundedCornerShape(105.dp), colors = CardDefaults.cardColors(containerColor = Surface)) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            CircularProgressIndicator({ performance.coerceIn(0, 100) / 100f }, Modifier.size(150.dp), Green, SurfaceAlt, 12.dp)
+@Composable
+fun PerformanceIndicator(
+    performance: Int,
+    isScanning: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val transition = rememberInfiniteTransition(label = "performancePulse")
+
+    val scale by transition.animateFloat(
+        initialValue = 1f,
+        targetValue = 1.035f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1_000),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "performanceScale"
+    )
+
+    Card(
+        modifier = modifier
+            .size(218.dp)
+            .scale(scale)
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(109.dp),
+        colors = CardDefaults.cardColors(containerColor = TurboSurface)
+    ) {
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center
+        ) {
+            CircularProgressIndicator(
+                progress = performance.coerceIn(0, 100).toFloat() / 100f,
+                modifier = Modifier.size(154.dp),
+                color = NeonGreen,
+                trackColor = TurboSurfaceAlt,
+                strokeWidth = 12.dp
+            )
+
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("$performance%", color = Primary, fontSize = 38.sp, fontWeight = FontWeight.Bold)
-                Text(if (scanning) "ANALIZANDO…" else "TOCA PARA ANALIZAR", color = Blue, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    text = "$performance%",
+                    color = TextPrimary,
+                    fontSize = 38.sp,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Text(
+                    text = if (isScanning) "ANALIZANDO…" else "TOCA PARA ANALIZAR",
+                    color = ElectricBlue,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold
+                )
             }
         }
     }
 }
 
-@Composable private fun OptimizationCard(info: CardInfo) {
-    Card(modifier = Modifier.fillMaxWidth().clickable(onClick = info.action), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Surface)) {
-        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(info.icon, info.title, tint = info.accent, modifier = Modifier.size(30.dp))
-            Column(Modifier.padding(start = 14.dp)) {
-                Text(info.title, color = Primary, fontWeight = FontWeight.Bold)
-                Text(info.subtitle, color = Secondary, fontSize = 12.sp)
-                Text(info.value, color = info.accent, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 4.dp))
-            }
+@Composable
+fun OptimizationCard(model: OptimizationCardModel) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = model.onClick),
+        shape = RoundedCornerShape(22.dp),
+        colors = CardDefaults.cardColors(containerColor = TurboSurface)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Icon(
+                imageVector = model.icon,
+                contentDescription = model.title,
+                tint = model.accent,
+                modifier = Modifier.size(30.dp)
+            )
+
+            Text(
+                text = model.title,
+                color = TextPrimary,
+                fontWeight = FontWeight.Bold,
+                fontSize = 15.sp
+            )
+
+            Text(
+                text = model.subtitle,
+                color = TextSecondary,
+                fontSize = 12.sp
+            )
+
+            Text(
+                text = model.value,
+                color = model.accent,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold
+            )
         }
     }
 }
 
 @Preview(showBackground = true, backgroundColor = 0xFF070B14)
-@Composable private fun TurboCleanPreview() = MaterialTheme {
-    TurboCleanScreen(TurboState(garbage = "4 elementos para revisar", network = "Red estable: 42 ms"), {}, {}, {}, {}, {}, {})
+@Composable
+fun TurboCleanPreview() {
+    MaterialTheme {
+        TurboCleanScreen(
+            state = TurboCleanUiState(
+                garbageText = "1,24 GB detectados",
+                networkText = "Red estable: 42 ms"
+            ),
+            onClean = {},
+            onNetwork = {},
+            onPermissions = {}
+        )
+    }
 }
